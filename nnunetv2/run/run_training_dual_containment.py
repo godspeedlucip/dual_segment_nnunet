@@ -3,11 +3,10 @@ import multiprocessing
 import os
 import shutil
 from time import time
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
+import numpy as np
 import torch
-from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
-from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.utilities.file_and_folder_operations import isfile, join, maybe_mkdir_p, save_json
 from torch import GradScaler, autocast
 
@@ -15,6 +14,8 @@ from nnunetv2.run.load_pretrained_weights import load_pretrained_weights
 from nnunetv2.run.run_training import get_trainer_from_args
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
+from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 
 
 def _select_checkpoint_for_resume(output_folder: str) -> Optional[str]:
@@ -78,15 +79,111 @@ def _write_metadata_files(trainer) -> None:
         shutil.copy(fp, join(trainer.output_folder_base, "dataset_fingerprint.json"))
 
 
-def _cleanup_augmenters(*augmenters) -> None:
-    for aug in augmenters:
-        if isinstance(aug, (NonDetMultiThreadedAugmenter, MultiThreadedAugmenter)):
-            aug._finish()
+def _assert_identifier_alignment(
+    keys_a: List[str],
+    keys_b: List[str],
+    split_name: str,
+    dataset_name_a: str,
+    dataset_name_b: str,
+) -> None:
+    set_a = set(keys_a)
+    set_b = set(keys_b)
+    if set_a == set_b:
+        return
+    only_a = sorted(list(set_a - set_b))[:10]
+    only_b = sorted(list(set_b - set_a))[:10]
+    raise RuntimeError(
+        f"Identifier mismatch in {split_name} split between {dataset_name_a} and {dataset_name_b}. "
+        f"Examples only in A: {only_a}; only in B: {only_b}"
+    )
+
+
+def _build_plain_dataloaders(trainer):
+    if trainer.dataset_class is None:
+        trainer.dataset_class = infer_dataset_class(trainer.preprocessed_dataset_folder)
+    patch_size = trainer.configuration_manager.patch_size
+    deep_supervision_scales = trainer._get_deep_supervision_scales()
+    rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = (
+        trainer.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+    )
+
+    tr_transforms = trainer.get_training_transforms(
+        patch_size,
+        rotation_for_DA,
+        deep_supervision_scales,
+        mirror_axes,
+        do_dummy_2d_data_aug,
+        use_mask_for_norm=trainer.configuration_manager.use_mask_for_norm,
+        is_cascaded=trainer.is_cascaded,
+        foreground_labels=trainer.label_manager.foreground_labels,
+        regions=trainer.label_manager.foreground_regions if trainer.label_manager.has_regions else None,
+        ignore_label=trainer.label_manager.ignore_label,
+    )
+    val_transforms = trainer.get_validation_transforms(
+        deep_supervision_scales,
+        is_cascaded=trainer.is_cascaded,
+        foreground_labels=trainer.label_manager.foreground_labels,
+        regions=trainer.label_manager.foreground_regions if trainer.label_manager.has_regions else None,
+        ignore_label=trainer.label_manager.ignore_label,
+    )
+
+    dataset_tr, dataset_val = trainer.get_tr_and_val_datasets()
+
+    dl_tr = nnUNetDataLoader(
+        dataset_tr,
+        trainer.batch_size,
+        initial_patch_size,
+        trainer.configuration_manager.patch_size,
+        trainer.label_manager,
+        oversample_foreground_percent=trainer.oversample_foreground_percent,
+        sampling_probabilities=None,
+        pad_sides=None,
+        transforms=tr_transforms,
+        probabilistic_oversampling=trainer.probabilistic_oversampling,
+    )
+    dl_val = nnUNetDataLoader(
+        dataset_val,
+        trainer.batch_size,
+        trainer.configuration_manager.patch_size,
+        trainer.configuration_manager.patch_size,
+        trainer.label_manager,
+        oversample_foreground_percent=trainer.oversample_foreground_percent,
+        sampling_probabilities=None,
+        pad_sides=None,
+        transforms=val_transforms,
+        probabilistic_oversampling=trainer.probabilistic_oversampling,
+    )
+    return dl_tr, dl_val, dataset_tr.identifiers, dataset_val.identifiers
+
+
+def _generate_batch_with_fixed_keys(dataloader: nnUNetDataLoader, keys: List[str]):
+    original_get_indices = dataloader.get_indices
+    dataloader.get_indices = lambda: list(keys)
+    try:
+        return dataloader.generate_train_batch()
+    finally:
+        dataloader.get_indices = original_get_indices
+
+
+def _generate_paired_batches(dataloader_a: nnUNetDataLoader, dataloader_b: nnUNetDataLoader):
+    # Best effort synchronization of random crop/augmentation between A and B.
+    seed = int(np.random.randint(0, 2**31 - 1))
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    batch_a = dataloader_a.generate_train_batch()
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    batch_b = _generate_batch_with_fixed_keys(dataloader_b, batch_a["keys"])
+    return batch_a, batch_b
 
 
 def _train_dual(
     trainer_a,
     trainer_b,
+    dataset_name_a: str,
+    dataset_name_b: str,
     warmup_epochs: int,
     total_epochs: int,
     lambda_containment: float,
@@ -103,7 +200,16 @@ def _train_dual(
 
     if trainer_a.enable_deep_supervision != trainer_b.enable_deep_supervision:
         raise RuntimeError(
-            "A and B must use the same deep supervision setting because joint training uses one shared dataloader."
+            "A and B must use the same deep supervision setting for stable paired training."
+        )
+    if tuple(trainer_a.configuration_manager.patch_size) != tuple(trainer_b.configuration_manager.patch_size):
+        raise RuntimeError(
+            "A and B patch_size differ. Use aligned plans/configuration so containment can be computed voxel-wise."
+        )
+    if trainer_a.batch_size != trainer_b.batch_size:
+        raise RuntimeError(
+            f"A and B batch_size differ (A={trainer_a.batch_size}, B={trainer_b.batch_size}). "
+            "Use aligned plans or manually align batch sizes."
         )
     if class_idx_a < 0 or class_idx_b < 0:
         raise ValueError("class_idx_a and class_idx_b must be >= 0.")
@@ -132,12 +238,22 @@ def _train_dual(
     _write_metadata_files(trainer_a)
     _write_metadata_files(trainer_b)
 
-    # Use one shared dataloader so A and B always see the same augmented patch.
-    dataloader_train, dataloader_val = trainer_a.get_dataloaders()
+    # Build plain dataloaders (without background augmenter workers) so we can force A/B to use identical keys.
+    dataloader_train_a, dataloader_val_a, tr_keys_a, val_keys_a = _build_plain_dataloaders(trainer_a)
+    dataloader_train_b, dataloader_val_b, tr_keys_b, val_keys_b = _build_plain_dataloaders(trainer_b)
+
+    _assert_identifier_alignment(tr_keys_a, tr_keys_b, "train", dataset_name_a, dataset_name_b)
+    _assert_identifier_alignment(val_keys_a, val_keys_b, "val", dataset_name_a, dataset_name_b)
 
     if trainer_a.local_rank == 0:
         trainer_a.dataset_class.unpack_dataset(
             trainer_a.preprocessed_dataset_folder,
+            overwrite_existing=False,
+            num_processes=max(1, round(get_allowed_n_proc_DA() // 2)),
+            verify=True,
+        )
+        trainer_b.dataset_class.unpack_dataset(
+            trainer_b.preprocessed_dataset_folder,
             overwrite_existing=False,
             num_processes=max(1, round(get_allowed_n_proc_DA() // 2)),
             verify=True,
@@ -190,13 +306,20 @@ def _train_dual(
             tr_violation = 0.0
 
             for _ in range(trainer_a.num_iterations_per_epoch):
-                batch = next(dataloader_train)
-                data = batch["data"].to(trainer_a.device, non_blocking=True)
-                target = batch["target"]
-                if isinstance(target, list):
-                    target = [i.to(trainer_a.device, non_blocking=True) for i in target]
+                batch_a, batch_b = _generate_paired_batches(dataloader_train_a, dataloader_train_b)
+
+                data_a = batch_a["data"].to(trainer_a.device, non_blocking=True)
+                data_b = batch_b["data"].to(trainer_b.device, non_blocking=True)
+                target_a = batch_a["target"]
+                target_b = batch_b["target"]
+                if isinstance(target_a, list):
+                    target_a = [i.to(trainer_a.device, non_blocking=True) for i in target_a]
                 else:
-                    target = target.to(trainer_a.device, non_blocking=True)
+                    target_a = target_a.to(trainer_a.device, non_blocking=True)
+                if isinstance(target_b, list):
+                    target_b = [i.to(trainer_b.device, non_blocking=True) for i in target_b]
+                else:
+                    target_b = target_b.to(trainer_b.device, non_blocking=True)
 
                 trainer_a.optimizer.zero_grad(set_to_none=True)
                 trainer_b.optimizer.zero_grad(set_to_none=True)
@@ -207,10 +330,10 @@ def _train_dual(
                     else dummy_context()
                 )
                 with amp_ctx:
-                    out_a = trainer_a.network(data)
-                    out_b = trainer_b.network(data)
-                    loss_sup_a = trainer_a.loss(out_a, target)
-                    loss_sup_b = trainer_b.loss(out_b, target)
+                    out_a = trainer_a.network(data_a)
+                    out_b = trainer_b.network(data_b)
+                    loss_sup_a = trainer_a.loss(out_a, target_a)
+                    loss_sup_b = trainer_b.loss(out_b, target_b)
                     loss_cont, violation_rate = _compute_containment_loss(
                         out_a,
                         out_b,
@@ -262,13 +385,20 @@ def _train_dual(
 
             with torch.no_grad():
                 for _ in range(trainer_a.num_val_iterations_per_epoch):
-                    batch = next(dataloader_val)
-                    data = batch["data"].to(trainer_a.device, non_blocking=True)
-                    target = batch["target"]
-                    if isinstance(target, list):
-                        target = [i.to(trainer_a.device, non_blocking=True) for i in target]
+                    batch_a, batch_b = _generate_paired_batches(dataloader_val_a, dataloader_val_b)
+
+                    data_a = batch_a["data"].to(trainer_a.device, non_blocking=True)
+                    data_b = batch_b["data"].to(trainer_b.device, non_blocking=True)
+                    target_a = batch_a["target"]
+                    target_b = batch_b["target"]
+                    if isinstance(target_a, list):
+                        target_a = [i.to(trainer_a.device, non_blocking=True) for i in target_a]
                     else:
-                        target = target.to(trainer_a.device, non_blocking=True)
+                        target_a = target_a.to(trainer_a.device, non_blocking=True)
+                    if isinstance(target_b, list):
+                        target_b = [i.to(trainer_b.device, non_blocking=True) for i in target_b]
+                    else:
+                        target_b = target_b.to(trainer_b.device, non_blocking=True)
 
                     amp_ctx = (
                         autocast(trainer_a.device.type, enabled=True)
@@ -276,10 +406,10 @@ def _train_dual(
                         else dummy_context()
                     )
                     with amp_ctx:
-                        out_a = trainer_a.network(data)
-                        out_b = trainer_b.network(data)
-                        loss_sup_a = trainer_a.loss(out_a, target)
-                        loss_sup_b = trainer_b.loss(out_b, target)
+                        out_a = trainer_a.network(data_a)
+                        out_b = trainer_b.network(data_b)
+                        loss_sup_a = trainer_a.loss(out_a, target_a)
+                        loss_sup_b = trainer_b.loss(out_b, target_b)
                         loss_cont, violation_rate = _compute_containment_loss(
                             out_a,
                             out_b,
@@ -346,7 +476,6 @@ def _train_dual(
         trainer_b.print_to_log_file("[DualTrain] Training finished. checkpoint_final.pth written for A and B.")
 
     finally:
-        _cleanup_augmenters(dataloader_train, dataloader_val)
         empty_cache(trainer_a.device)
 
     if run_final_validation:
@@ -357,7 +486,8 @@ def _train_dual(
 
 
 def run_training_dual_containment(
-    dataset_name_or_id: Union[str, int],
+    dataset_name_or_id_a: Union[str, int],
+    dataset_name_or_id_b: Union[str, int],
     configuration: str,
     fold: Union[int, str],
     trainer_a_name: str = "nnUNetTrainerA",
@@ -393,10 +523,10 @@ def run_training_dual_containment(
         raise RuntimeError("Cannot set continue_joint together with pretrained weights.")
 
     trainer_a = get_trainer_from_args(
-        str(dataset_name_or_id), configuration, fold, trainer_a_name, plans_identifier, device=device
+        str(dataset_name_or_id_a), configuration, fold, trainer_a_name, plans_identifier, device=device
     )
     trainer_b = get_trainer_from_args(
-        str(dataset_name_or_id), configuration, fold, trainer_b_name, plans_identifier, device=device
+        str(dataset_name_or_id_b), configuration, fold, trainer_b_name, plans_identifier, device=device
     )
 
     trainer_a.disable_checkpointing = disable_checkpointing
@@ -432,6 +562,8 @@ def run_training_dual_containment(
     _train_dual(
         trainer_a=trainer_a,
         trainer_b=trainer_b,
+        dataset_name_a=trainer_a.plans_manager.dataset_name,
+        dataset_name_b=trainer_b.plans_manager.dataset_name,
         warmup_epochs=warmup_epochs,
         total_epochs=total_epochs,
         lambda_containment=lambda_containment,
@@ -447,7 +579,8 @@ def run_training_dual_containment(
 
 def run_training_dual_containment_entry():
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset_name_or_id", type=str, help="Dataset name or ID.")
+    parser.add_argument("dataset_name_or_id_A", type=str, help="Dataset name or ID for network A.")
+    parser.add_argument("dataset_name_or_id_B", type=str, help="Dataset name or ID for network B.")
     parser.add_argument("configuration", type=str, help="nnU-Net configuration, e.g. 3d_fullres.")
     parser.add_argument("fold", type=str, help='Fold [0..4] or "all".')
     parser.add_argument("-trA", type=str, default="nnUNetTrainerA", help="Trainer class for network A.")
@@ -503,7 +636,8 @@ def run_training_dual_containment_entry():
         device = torch.device("mps")
 
     run_training_dual_containment(
-        dataset_name_or_id=args.dataset_name_or_id,
+        dataset_name_or_id_a=args.dataset_name_or_id_A,
+        dataset_name_or_id_b=args.dataset_name_or_id_B,
         configuration=args.configuration,
         fold=args.fold,
         trainer_a_name=args.trA,
